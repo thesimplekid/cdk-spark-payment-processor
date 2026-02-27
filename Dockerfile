@@ -1,5 +1,5 @@
 # ─── Stage 1: Builder ────────────────────────────────────────────────────────
-FROM rust:1.86-bookworm AS builder
+FROM rust:latest AS builder
 
 # Install protobuf compiler (required by tonic-build at compile time)
 RUN apt-get update && apt-get install -y --no-install-recommends \
