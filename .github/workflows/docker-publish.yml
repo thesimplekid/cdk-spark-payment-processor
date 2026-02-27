@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - master
+      - feat/docker-build
     tags:
       - 'v*'
   workflow_dispatch: {}
@@ -22,7 +23,7 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
+m
       # Generates tags and labels (version, latest, sha, etc.)
       - name: Docker metadata
         id: meta
