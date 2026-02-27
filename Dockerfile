@@ -1,9 +1,12 @@
 # ─── Stage 1: Builder ────────────────────────────────────────────────────────
 FROM rust:latest AS builder
 
-# Install protobuf compiler (required by tonic-build at compile time)
+# protobuf-compiler  → provides the `protoc` binary
+# libprotobuf-dev    → provides the well-known .proto includes (google/protobuf/*.proto)
+#                      that spark-sdk's build.rs imports at compile time
 RUN apt-get update && apt-get install -y --no-install-recommends \
     protobuf-compiler \
+    libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
