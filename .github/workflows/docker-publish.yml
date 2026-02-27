@@ -23,7 +23,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-m
       # Generates tags and labels (version, latest, sha, etc.)
       - name: Docker metadata
         id: meta
