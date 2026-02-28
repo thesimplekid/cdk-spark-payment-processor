@@ -195,6 +195,7 @@ impl BreezBackend {
             .disconnect()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to disconnect from Breez SDK: {:?}", e))?;
+        self.wait_invoice_active.store(false, Ordering::Relaxed);
         tracing::info!("Breez SDK disconnected successfully");
         Ok(())
     }
