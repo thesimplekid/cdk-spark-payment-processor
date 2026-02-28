@@ -6,13 +6,13 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use breez_sdk_spark::{
-    BreezSdk, Config, ConnectRequest, Network, OptimizationConfig, ReceivePaymentMethod,
-    ReceivePaymentRequest, Seed,
+    BreezSdk, Config, ConnectRequest, Network, OptimizationConfig, PaymentType,
+    ReceivePaymentMethod, ReceivePaymentRequest, Seed,
 };
 use cdk_common::bitcoin::hashes::Hash;
 use cdk_common::nuts::{CurrencyUnit, MeltQuoteState};
@@ -24,21 +24,50 @@ use cdk_common::payment::{
 use cdk_common::util::unix_time;
 use cdk_common::Bolt11Invoice;
 use futures_core::Stream;
-use tokio::sync::Mutex;
+use std::task::{Context, Poll};
 
 use crate::database::QuoteDatabase;
 use crate::settings::BackendConfig;
+
+/// Wrapper stream that automatically cleans up event listeners when dropped
+pub struct PaymentEventStream {
+    sdk: Arc<breez_sdk_spark::BreezSdk>,
+    listener_id: String,
+    active_streams: Arc<AtomicUsize>,
+    stream: Pin<Box<dyn Stream<Item = Event> + Send>>,
+}
+
+impl Stream for PaymentEventStream {
+    type Item = Event;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.stream.as_mut().poll_next(cx)
+    }
+}
+
+impl Drop for PaymentEventStream {
+    fn drop(&mut self) {
+        let sdk = self.sdk.clone();
+        let listener_id = self.listener_id.clone();
+        let active_streams = self.active_streams.clone();
+
+        tokio::spawn(async move {
+            if !sdk.remove_event_listener(&listener_id).await {
+                tracing::warn!("Failed to remove event listener: {}", listener_id);
+            }
+            active_streams.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+}
 
 /// Breez SDK Spark backend implementation
 pub struct BreezBackend {
     /// The Breez SDK instance
     sdk: Arc<BreezSdk>,
-    /// Flag to track if we're actively waiting for invoice payments
-    wait_invoice_active: Arc<AtomicBool>,
     /// Database for storing quote-to-payment mappings
     db: QuoteDatabase,
-    /// Event listener IDs for cleanup on disconnect
-    listener_ids: Arc<Mutex<Vec<String>>>,
+    /// Counter for active payment event streams
+    active_streams: Arc<AtomicUsize>,
 }
 
 impl BreezBackend {
@@ -171,9 +200,8 @@ impl BreezBackend {
 
         Ok(Self {
             sdk: Arc::new(sdk),
-            wait_invoice_active: Arc::new(AtomicBool::new(false)),
             db,
-            listener_ids: Arc::new(Mutex::new(Vec::new())),
+            active_streams: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -181,16 +209,10 @@ impl BreezBackend {
     pub async fn disconnect(&self) -> anyhow::Result<()> {
         tracing::info!("Disconnecting from Breez SDK...");
 
-        // First, remove all event listeners
-        let mut ids = self.listener_ids.lock().await;
-        tracing::info!("Removing {} event listener(s)", ids.len());
-        for listener_id in ids.drain(..) {
-            if !self.sdk.remove_event_listener(&listener_id).await {
-                tracing::warn!("Failed to remove event listener: {}", listener_id);
-            }
-        }
+        // Note: Event listeners are automatically cleaned up when their
+        // PaymentEventStream is dropped. Active streams should be dropped
+        // before calling disconnect.
 
-        // Then disconnect from the SDK
         self.sdk
             .disconnect()
             .await
@@ -210,7 +232,7 @@ impl MintPayment for BreezBackend {
         Ok(SettingsResponse {
             unit: "sat".to_string(),
             bolt11: Some(Bolt11Settings {
-                mpp: true,
+                mpp: false,
                 amountless: false,
                 invoice_description: false,
             }),
@@ -228,10 +250,7 @@ impl MintPayment for BreezBackend {
         tracing::info!("Creating incoming payment request");
         match options {
             IncomingPaymentOptions::Bolt11(opts) => {
-                let description = opts
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| "Payment".to_string());
+                let description = opts.description.as_deref().unwrap_or("Payment");
                 let amount_sats = if opts.amount > cdk_common::Amount::from(0) {
                     Some(Into::<u64>::into(opts.amount))
                 } else {
@@ -256,7 +275,7 @@ impl MintPayment for BreezBackend {
 
                 let request = ReceivePaymentRequest {
                     payment_method: ReceivePaymentMethod::Bolt11Invoice {
-                        description: description.clone(),
+                        description: description.to_string(),
                         amount_sats,
                         expiry_secs,
                         payment_hash: None,
@@ -447,8 +466,6 @@ impl MintPayment for BreezBackend {
         use tokio::sync::mpsc;
         use tokio_stream::wrappers::ReceiverStream;
 
-        self.wait_invoice_active.store(true, Ordering::Relaxed);
-
         let (tx, rx) = mpsc::channel(100);
 
         // Create event listener
@@ -464,49 +481,37 @@ impl MintPayment for BreezBackend {
 
                 if let SdkEvent::PaymentSucceeded { payment } = event {
                     // Extract payment hash from payment details
-                    let payment_identifier = if let Some(PaymentDetails::Lightning {
-                        ref htlc_details,
-                        ..
+                    let Some(PaymentDetails::Lightning {
+                        ref htlc_details, ..
                     }) = payment.details
-                    {
-                        let payment_hash = &htlc_details.payment_hash;
-                        // Convert hex string to bytes
-                        if let Ok(hash_bytes) = hex::decode(payment_hash) {
-                            if let Ok(hash_array) = hash_bytes.try_into() {
-                                PaymentIdentifier::PaymentHash(hash_array)
-                            } else {
-                                tracing::warn!("Payment hash wrong length: {}", payment_hash);
-                                // Fallback to payment ID bytes
-                                PaymentIdentifier::PaymentHash(
-                                    payment.id.as_bytes()[..32].try_into().unwrap_or([0; 32]),
-                                )
-                            }
-                        } else {
-                            tracing::warn!("Failed to decode payment hash: {}", payment_hash);
-                            // Fallback to payment ID bytes
-                            PaymentIdentifier::PaymentHash(
-                                payment.id.as_bytes()[..32].try_into().unwrap_or([0; 32]),
-                            )
-                        }
-                    } else {
-                        tracing::warn!(
-                            "No Lightning payment details found for payment: {}",
-                            payment.id
-                        );
-                        // Fallback to payment ID bytes
-                        PaymentIdentifier::PaymentHash(
-                            payment.id.as_bytes()[..32].try_into().unwrap_or([0; 32]),
-                        )
+                    else {
+                        tracing::error!("No Lightning details for payment: {}", payment.id);
+                        return;
                     };
+
+                    if payment.payment_type != PaymentType::Receive {
+                        tracing::error!("Expected receive payment");
+                        return;
+                    }
+
+                    let payment_hash = &htlc_details.payment_hash;
+                    let Ok(hash_bytes) = hex::decode(payment_hash) else {
+                        tracing::error!("Failed to decode payment hash: {}", payment_hash);
+                        return;
+                    };
+
+                    let Ok(hash_array) = hash_bytes.try_into() else {
+                        tracing::error!("Payment hash wrong length: {}", payment_hash);
+                        return;
+                    };
+
+                    let payment_identifier = PaymentIdentifier::PaymentHash(hash_array);
 
                     // Convert to CDK event
                     let cdk_event = Event::PaymentReceived(WaitPaymentResponse {
                         payment_id: payment.id.clone(),
                         payment_identifier,
-                        payment_amount: Amount::new(
-                            (payment.amount + payment.fees) as u64,
-                            CurrencyUnit::Sat,
-                        ),
+                        payment_amount: Amount::new((payment.amount) as u64, CurrencyUnit::Sat),
                     });
 
                     let _ = self.sender.send(cdk_event).await;
@@ -518,20 +523,29 @@ impl MintPayment for BreezBackend {
 
         let listener_id = self.sdk.add_event_listener(listener).await;
 
-        // Store the listener ID for cleanup on disconnect
-        self.listener_ids.lock().await.push(listener_id);
+        // Increment active stream counter
+        self.active_streams.fetch_add(1, Ordering::Relaxed);
 
-        Ok(Box::pin(ReceiverStream::new(rx)))
+        // Return the wrapped stream that will clean up its own listener on drop
+        Ok(Box::pin(PaymentEventStream {
+            sdk: self.sdk.clone(),
+            listener_id,
+            active_streams: self.active_streams.clone(),
+            stream: Box::pin(ReceiverStream::new(rx)),
+        }))
     }
 
-    /// Check if wait invoice is currently active
+    /// Check if wait invoice is currently active (any streams are active)
     fn is_wait_invoice_active(&self) -> bool {
-        self.wait_invoice_active.load(Ordering::Relaxed)
+        self.active_streams.load(Ordering::Relaxed) > 0
     }
 
     /// Cancel waiting for invoice payments
+    /// Note: This only sets a flag. Active streams will clean themselves up when dropped.
     fn cancel_wait_invoice(&self) {
-        self.wait_invoice_active.store(false, Ordering::Relaxed);
+        // Streams are self-managing and will clean up when dropped.
+        // This method is kept for trait compatibility.
+        tracing::debug!("cancel_wait_invoice called - streams will clean up on drop");
     }
 
     /// Check the status of an incoming payment
@@ -609,10 +623,7 @@ impl MintPayment for BreezBackend {
                 let payment_response = WaitPaymentResponse {
                     payment_id: payment.id.clone(),
                     payment_identifier: payment_identifier.clone(),
-                    payment_amount: Amount::new(
-                        (payment.amount + payment.fees) as u64,
-                        CurrencyUnit::Sat,
-                    ),
+                    payment_amount: Amount::new((payment.amount) as u64, CurrencyUnit::Sat),
                 };
 
                 tracing::debug!("Returning payment response: {:?}", payment_response);
