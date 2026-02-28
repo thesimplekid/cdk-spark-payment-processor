@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use breez_sdk_spark::{
-    BreezSdk, Config, ConnectRequest, Network, OptimizationConfig, ReceivePaymentMethod,
-    ReceivePaymentRequest, Seed,
+    BreezSdk, Config, ConnectRequest, Network, OptimizationConfig, PaymentType,
+    ReceivePaymentMethod, ReceivePaymentRequest, Seed,
 };
 use cdk_common::bitcoin::hashes::Hash;
 use cdk_common::nuts::{CurrencyUnit, MeltQuoteState};
@@ -472,6 +472,11 @@ impl MintPayment for BreezBackend {
                         return;
                     };
 
+                    if payment.payment_type != PaymentType::Receive {
+                        tracing::error!("Expected receive payment");
+                        return;
+                    }
+
                     let payment_hash = &htlc_details.payment_hash;
                     let Ok(hash_bytes) = hex::decode(payment_hash) else {
                         tracing::error!("Failed to decode payment hash: {}", payment_hash);
@@ -489,10 +494,7 @@ impl MintPayment for BreezBackend {
                     let cdk_event = Event::PaymentReceived(WaitPaymentResponse {
                         payment_id: payment.id.clone(),
                         payment_identifier,
-                        payment_amount: Amount::new(
-                            (payment.amount + payment.fees) as u64,
-                            CurrencyUnit::Sat,
-                        ),
+                        payment_amount: Amount::new((payment.amount) as u64, CurrencyUnit::Sat),
                     });
 
                     let _ = self.sender.send(cdk_event).await;
