@@ -464,40 +464,26 @@ impl MintPayment for BreezBackend {
 
                 if let SdkEvent::PaymentSucceeded { payment } = event {
                     // Extract payment hash from payment details
-                    let payment_identifier = if let Some(PaymentDetails::Lightning {
-                        ref htlc_details,
-                        ..
+                    let Some(PaymentDetails::Lightning {
+                        ref htlc_details, ..
                     }) = payment.details
-                    {
-                        let payment_hash = &htlc_details.payment_hash;
-                        // Convert hex string to bytes
-                        if let Ok(hash_bytes) = hex::decode(payment_hash) {
-                            if let Ok(hash_array) = hash_bytes.try_into() {
-                                PaymentIdentifier::PaymentHash(hash_array)
-                            } else {
-                                tracing::warn!("Payment hash wrong length: {}", payment_hash);
-                                // Fallback to payment ID bytes
-                                PaymentIdentifier::PaymentHash(
-                                    payment.id.as_bytes()[..32].try_into().unwrap_or([0; 32]),
-                                )
-                            }
-                        } else {
-                            tracing::warn!("Failed to decode payment hash: {}", payment_hash);
-                            // Fallback to payment ID bytes
-                            PaymentIdentifier::PaymentHash(
-                                payment.id.as_bytes()[..32].try_into().unwrap_or([0; 32]),
-                            )
-                        }
-                    } else {
-                        tracing::warn!(
-                            "No Lightning payment details found for payment: {}",
-                            payment.id
-                        );
-                        // Fallback to payment ID bytes
-                        PaymentIdentifier::PaymentHash(
-                            payment.id.as_bytes()[..32].try_into().unwrap_or([0; 32]),
-                        )
+                    else {
+                        tracing::error!("No Lightning details for payment: {}", payment.id);
+                        return;
                     };
+
+                    let payment_hash = &htlc_details.payment_hash;
+                    let Ok(hash_bytes) = hex::decode(payment_hash) else {
+                        tracing::error!("Failed to decode payment hash: {}", payment_hash);
+                        return;
+                    };
+
+                    let Ok(hash_array) = hash_bytes.try_into() else {
+                        tracing::error!("Payment hash wrong length: {}", payment_hash);
+                        return;
+                    };
+
+                    let payment_identifier = PaymentIdentifier::PaymentHash(hash_array);
 
                     // Convert to CDK event
                     let cdk_event = Event::PaymentReceived(WaitPaymentResponse {
